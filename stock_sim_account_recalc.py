@@ -694,7 +694,7 @@ def recalc(*, as_of: dt.date, dry_run: bool, mark_transactions: bool) -> None:
         external_flow = num_or_none(tx.get("外部现金流USD"))
         fx = (
             transaction_fx(tx, security_id, tx_dt.date())
-            if tx_type in {"买入股票", "卖出股票"} and security_id
+            if tx_type in {"买入股票", "卖出股票", "分红"} and security_id
             else 1.0
         )
 
@@ -741,7 +741,9 @@ def recalc(*, as_of: dt.date, dry_run: bool, mark_transactions: bool) -> None:
             if h.qty < -1e-8:
                 h.note = "卖出数量超过持仓，需检查"
         elif tx_type == "分红":
-            amount = cash_impact or 0.0
+            # 分红与卖出同口径：现金流入 = 数量(应分红股数) × 成交价(每股股息·原币) × 汇率。
+            # 现金影响USD 仅作为可选覆盖：填了就用它，留空则按结构化字段自动计算。
+            amount = cash_impact if cash_impact is not None else qty * price * fx
             cash += amount
             holding_for(security_id).realized += amount
         elif tx_type == "拆股/合股":
