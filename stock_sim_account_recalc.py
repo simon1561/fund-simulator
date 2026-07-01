@@ -989,6 +989,7 @@ def recalc(*, as_of: dt.date, dry_run: bool, mark_transactions: bool, auto_divid
 
     frozen_cash = sum(pos.frozen_cash for pos in puts if pos.status == "未到期")
     stock_value = 0.0
+    pure_stock_value = 0.0  # 不含类现金标的（如 SGOV），用于「股票仓位率」
     holding_payloads: list[tuple[str, dict[str, Any]]] = []
     existing_holding_rows = list_records(
         TABLE["holdings"],
@@ -1016,6 +1017,8 @@ def recalc(*, as_of: dt.date, dry_run: bool, mark_transactions: bool, auto_divid
         native_price = latest_price.close if latest_price else num(existing_holding.get("最新价原币"), price)
         market_value = h.qty * price
         stock_value += market_value
+        if asset_type_by_id.get(security_id, "股票") != "类现金":
+            pure_stock_value += market_value
         status = "持仓中" if abs(h.qty) > 1e-8 else "已清仓"
         note = h.note
         if status == "持仓中" and latest_price is None and price <= 0:
@@ -1184,8 +1187,9 @@ def recalc(*, as_of: dt.date, dry_run: bool, mark_transactions: bool, auto_divid
         daily_twr = 0.0
         cumulative_twr = 0.0
 
-    # 派生指标：仓位率、年化收益率、最大回撤（写回供「收益统计」看板展示）。
-    position_ratio = stock_value / nav if abs(nav) > 1e-8 else 0.0
+    # 派生指标：股票仓位率（不含类现金）、年化收益率、最大回撤（写回供「收益统计」看板展示）。
+    cash_equiv_value = stock_value - pure_stock_value  # 类现金标的（如 SGOV）市值
+    stock_position_ratio = pure_stock_value / nav if abs(nav) > 1e-8 else 0.0
     twr_days = (as_of - twr_start_dt.date()).days if twr_start_dt else 0
     twr_base = 1 + cumulative_twr
     annualized_return = (
@@ -1209,10 +1213,11 @@ def recalc(*, as_of: dt.date, dry_run: bool, mark_transactions: bool, auto_divid
         "当前现金USD": cash,
         "冻结现金USD": frozen_cash,
         "可用现金USD": cash - frozen_cash,
-        "股票市值USD": stock_value,
+        "股票市值USD": pure_stock_value,
+        "类现金市值USD": cash_equiv_value,
         "当前NAVUSD": nav,
         "累计TWR": cumulative_twr,
-        "仓位率": position_ratio,
+        "股票仓位率": stock_position_ratio,
         "年化收益率": annualized_return,
         "最大回撤": max_drawdown,
     }
@@ -1236,7 +1241,8 @@ def recalc(*, as_of: dt.date, dry_run: bool, mark_transactions: bool, auto_divid
         "现金USD": cash,
         "冻结现金USD": frozen_cash,
         "可用现金USD": cash - frozen_cash,
-        "股票市值USD": stock_value,
+        "股票市值USD": pure_stock_value,
+        "类现金市值USD": cash_equiv_value,
         "NAVUSD": nav,
         "外部现金流USD": external_flow_today,
         "当日TWR": daily_twr,
@@ -1258,7 +1264,8 @@ def recalc(*, as_of: dt.date, dry_run: bool, mark_transactions: bool, auto_divid
 
     print(f"Cash: {cash:,.2f}")
     print(f"Frozen cash: {frozen_cash:,.2f}")
-    print(f"Stock value: {stock_value:,.2f}")
+    print(f"Stock value: {pure_stock_value:,.2f}")
+    print(f"Cash-equiv value: {cash_equiv_value:,.2f}")
     print(f"NAV: {nav:,.2f}")
     print(f"Daily TWR: {daily_twr:.4%}")
     print(f"Cumulative TWR: {cumulative_twr:.4%}")
