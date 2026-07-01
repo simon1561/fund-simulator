@@ -94,6 +94,8 @@ class Holding:
     cost: float = 0.0
     native_cost: float = 0.0
     realized: float = 0.0
+    dividend: float = 0.0          # 累计分红 USD（摊薄成本法：冲减成本，不计入已实现）
+    native_dividend: float = 0.0   # 累计分红 原币
     note: str = ""
 
 
@@ -616,7 +618,160 @@ def initial_baseline_snapshot_payload(baseline_date: dt.date, initial_cash: floa
     }
 
 
-def recalc(*, as_of: dt.date, dry_run: bool, mark_transactions: bool) -> None:
+def fetch_dividends(ticker: str, start_date: dt.date, end_date: dt.date) -> list[tuple[dt.date, float]]:
+    """返回 [(除息日, 每股派息·原币), ...]；优先 yfinance，失败回退 Yahoo chart(events=div)。"""
+    start = start_date - dt.timedelta(days=1)
+    end = end_date + dt.timedelta(days=1)
+    try:
+        import yfinance as yf  # type: ignore
+    except ImportError:
+        yf = None
+    if yf is not None:
+        try:
+            hist = yf.Ticker(ticker).history(
+                start=f"{start:%Y-%m-%d}",
+                end=f"{end:%Y-%m-%d}",
+                interval="1d",
+                auto_adjust=False,
+                actions=True,
+            )
+            if not hist.empty:
+                if "Dividends" not in hist:
+                    return []
+                out: list[tuple[dt.date, float]] = []
+                for idx, value in hist["Dividends"].items():
+                    amount = float(value or 0.0)
+                    if amount > 0:
+                        out.append((idx.date(), amount))
+                return sorted(out)
+        except Exception:  # noqa: BLE001 - fall back to Yahoo chart events=div
+            pass
+    p1 = int(dt.datetime(start.year, start.month, start.day, tzinfo=dt.UTC).timestamp())
+    p2 = int(dt.datetime(end.year, end.month, end.day, tzinfo=dt.UTC).timestamp())
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+        f"?period1={p1}&period2={p2}&interval=1d&events=div"
+    )
+    payload = fetch_yahoo_json(url)
+    result = ((payload.get("chart") or {}).get("result") or [{}])[0]
+    events = (result.get("events") or {}).get("dividends") or {}
+    out = []
+    for event in events.values():
+        ts = event.get("date")
+        amount = event.get("amount")
+        if ts is None or amount is None:
+            continue
+        out.append((dt.datetime.fromtimestamp(int(ts), dt.UTC).date(), float(amount)))
+    return sorted(out)
+
+
+def compute_shares_on(security_id: str, ex_date: dt.date, transactions: list[dict[str, Any]]) -> float:
+    """回放除息日之前的买入/卖出/拆股/被指派，得到除息日应享分红的持股数。"""
+    shares = 0.0
+    for tx in transactions:
+        tx_dt = parse_datetime(tx.get("交易日期"))
+        if not tx_dt or tx_dt.date() >= ex_date:
+            continue
+        if link_id(tx.get("证券")) != security_id:
+            continue
+        tx_type = first_select(tx.get("交易类型"))
+        qty = num(tx.get("数量"))
+        if tx_type == "买入股票":
+            shares += qty
+        elif tx_type == "卖出股票":
+            shares -= qty
+        elif tx_type == "Put被指派":
+            shares += qty
+        elif tx_type == "拆股/合股":
+            ratio = num(tx.get("拆合股比例"), 1.0)
+            if ratio > 0:
+                shares *= ratio
+    return shares
+
+
+def autofill_cash_dividends(
+    transactions: list[dict[str, Any]],
+    securities_by_id: dict[str, dict[str, Any]],
+    as_of: dt.date,
+    *,
+    dry_run: bool,
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    """为每个有买入的证券补齐 yfinance 现金分红，写回交易流水（去重：证券+除息日）。
+
+    返回新建的交易（内存形态，供 dry-run 注入回放；正式运行会重新拉取交易流水）。
+    只覆盖现金分红；实物分红（如派股票）yfinance 无数据，需人工补录。
+    """
+    existing: set[tuple[str, dt.date]] = set()
+    earliest_buy: dict[str, dt.date] = {}
+    for tx in transactions:
+        tx_dt = parse_datetime(tx.get("交易日期"))
+        if not tx_dt:
+            continue
+        security_id = link_id(tx.get("证券"))
+        if not security_id:
+            continue
+        tx_type = first_select(tx.get("交易类型"))
+        if tx_type == "分红":
+            existing.add((security_id, tx_dt.date()))
+        elif tx_type == "买入股票":
+            day = tx_dt.date()
+            if security_id not in earliest_buy or day < earliest_buy[security_id]:
+                earliest_buy[security_id] = day
+
+    created: list[dict[str, Any]] = []
+    seq = 0
+    for security_id in sorted(earliest_buy):
+        security = securities_by_id.get(security_id)
+        if not security:
+            continue
+        ticker = security_ticker(security)
+        if not ticker:
+            continue
+        start = earliest_buy[security_id]
+        try:
+            dividends = fetch_dividends(ticker, start, as_of)
+        except Exception as exc:  # noqa: BLE001 - a dividend fetch must never break the recalc
+            warnings.append(f"{security_label(security) or ticker} 自动分红抓取失败，已跳过：{exc}")
+            continue
+        for ex_date, per_share in dividends:
+            if ex_date < start or ex_date > as_of:
+                continue
+            if (security_id, ex_date) in existing:
+                continue
+            shares = compute_shares_on(security_id, ex_date, transactions)
+            if shares <= 1e-8:
+                continue
+            payload = {
+                "交易编号": f"AUTO-DIV-{ticker}-{ex_date:%Y%m%d}",
+                "交易类型": "分红",
+                "证券": [{"id": security_id}],
+                "交易日期": f"{ex_date:%Y-%m-%d} 09:30:00",
+                "数量": shares,
+                "成交价": per_share,
+                "备注": "自动生成（yfinance 现金分红，可手动改金额；删除会在下次重算重建，作废请把数量改为 0）",
+            }
+            upsert_record(TABLE["transactions"], payload, None, dry_run=dry_run)
+            existing.add((security_id, ex_date))
+            created.append(
+                {
+                    "record_id": f"AUTODIV-{ex_date:%Y%m%d}-{seq}",
+                    "交易编号": payload["交易编号"],
+                    "交易类型": "分红",
+                    "证券": [{"id": security_id}],
+                    "交易日期": payload["交易日期"],
+                    "数量": shares,
+                    "成交价": per_share,
+                    "备注": payload["备注"],
+                }
+            )
+            seq += 1
+    if created:
+        warnings.append(f"自动补录现金分红 {len(created)} 笔（标注「自动生成」，可在交易流水核对/调整）")
+    return created
+
+
+def recalc(*, as_of: dt.date, dry_run: bool, mark_transactions: bool, auto_dividends: bool = True) -> None:
     setting_rows = list_records(TABLE["account"])
     account = next((row for row in setting_rows if first_select(row.get("设置分类")) == "账户设置"), None)
     if account is None:
@@ -677,6 +832,16 @@ def recalc(*, as_of: dt.date, dry_run: bool, mark_transactions: bool) -> None:
             except LarkError as exc:
                 warnings.append(f"{tx['record_id']} computed USD汇率 {fx}, but could not write it back: {exc}")
             return fx
+
+    if auto_dividends:
+        auto_created = autofill_cash_dividends(
+            transactions, securities_by_id, as_of, dry_run=dry_run, warnings=warnings
+        )
+        if auto_created:
+            transactions = (
+                transactions + auto_created if dry_run else list_records(TABLE["transactions"])
+            )
+            transactions.sort(key=lambda row: parse_datetime(row.get("交易日期")) or dt.datetime.min)
 
     for tx in transactions:
         tx_dt = parse_datetime(tx.get("交易日期"))
@@ -743,9 +908,13 @@ def recalc(*, as_of: dt.date, dry_run: bool, mark_transactions: bool) -> None:
         elif tx_type == "分红":
             # 分红与卖出同口径：现金流入 = 数量(应分红股数) × 成交价(每股股息·原币) × 汇率。
             # 现金影响USD 仅作为可选覆盖：填了就用它，留空则按结构化字段自动计算。
+            # 记账采用「摊薄成本法」（对齐雪球）：分红不计入已实现盈亏，而是冲减持仓成本。
             amount = cash_impact if cash_impact is not None else qty * price * fx
+            native_amount = qty * price if qty and price else (amount / fx if fx else 0.0)
             cash += amount
-            holding_for(security_id).realized += amount
+            h = holding_for(security_id)
+            h.dividend += amount
+            h.native_dividend += native_amount
         elif tx_type == "拆股/合股":
             ratio = num(tx.get("拆合股比例"), 1.0)
             if ratio <= 0:
@@ -854,16 +1023,19 @@ def recalc(*, as_of: dt.date, dry_run: bool, mark_transactions: bool) -> None:
             note = (note + "；" if note else "") + "缺少实时行情"
         elif status == "持仓中" and latest_price is None:
             note = (note + "；" if note else "") + "行情抓取失败，沿用上次价格"
-        floating = market_value - h.cost
-        floating_return = floating / h.cost if abs(h.cost) > 1e-8 else None
+        diluted_cost = h.cost - h.dividend
+        diluted_native_cost = h.native_cost - h.native_dividend
+        floating = market_value - diluted_cost
+        floating_return = floating / diluted_cost if abs(diluted_cost) > 1e-8 else None
         payload = {
             "标的": code,
             "证券": [{"id": security_id}],
             "股数": h.qty,
             "最新价原币": native_price,
-            "平均成本原币": h.native_cost / h.qty if abs(h.qty) > 1e-8 else 0,
-            "平均成本USD": h.cost / h.qty if abs(h.qty) > 1e-8 else 0,
-            "成本": h.cost,
+            "买入均价原币": h.native_cost / h.qty if abs(h.qty) > 1e-8 else 0,
+            "平均成本原币": diluted_native_cost / h.qty if abs(h.qty) > 1e-8 else 0,
+            "平均成本USD": diluted_cost / h.qty if abs(h.qty) > 1e-8 else 0,
+            "成本": diluted_cost,
             "最新价USD": price,
             "市值": market_value,
             "盈亏额度": floating,
@@ -1012,6 +1184,27 @@ def recalc(*, as_of: dt.date, dry_run: bool, mark_transactions: bool) -> None:
         daily_twr = 0.0
         cumulative_twr = 0.0
 
+    # 派生指标：仓位率、年化收益率、最大回撤（写回供「收益统计」看板展示）。
+    position_ratio = stock_value / nav if abs(nav) > 1e-8 else 0.0
+    twr_days = (as_of - twr_start_dt.date()).days if twr_start_dt else 0
+    twr_base = 1 + cumulative_twr
+    annualized_return = (
+        twr_base ** (365 / twr_days) - 1 if twr_days >= 1 and twr_base > 0 else cumulative_twr
+    )
+    nav_history = [
+        num(snapshot_by_date[date].get("NAVUSD"), initial_cash)
+        for date in sorted(snapshot_by_date)
+        if date < as_of
+    ]
+    nav_history.append(nav)
+    peak = nav_history[0]
+    max_drawdown = 0.0
+    for value in nav_history:
+        if value > peak:
+            peak = value
+        if peak > 0:
+            max_drawdown = min(max_drawdown, value / peak - 1)
+
     account_payload = {
         "当前现金USD": cash,
         "冻结现金USD": frozen_cash,
@@ -1019,6 +1212,9 @@ def recalc(*, as_of: dt.date, dry_run: bool, mark_transactions: bool) -> None:
         "股票市值USD": stock_value,
         "当前NAVUSD": nav,
         "累计TWR": cumulative_twr,
+        "仓位率": position_ratio,
+        "年化收益率": annualized_return,
+        "最大回撤": max_drawdown,
     }
     upsert_record(TABLE["account"], account_payload, account["record_id"], dry_run=dry_run)
 
@@ -1101,11 +1297,18 @@ def latest_benchmark_returns(as_of: dt.date, warnings: list[str]) -> dict[str, f
     return result
 
 
-def run_cycle(*, as_of: dt.date, update_prices_flag: bool, dry_run: bool, mark_transactions: bool) -> None:
+def run_cycle(
+    *,
+    as_of: dt.date,
+    update_prices_flag: bool,
+    dry_run: bool,
+    mark_transactions: bool,
+    auto_dividends: bool = True,
+) -> None:
     if update_prices_flag:
         print("Market data is fetched live during recalculation; no 行情快照 records are written.")
     resolve_table_ids()
-    recalc(as_of=as_of, dry_run=dry_run, mark_transactions=mark_transactions)
+    recalc(as_of=as_of, dry_run=dry_run, mark_transactions=mark_transactions, auto_dividends=auto_dividends)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1125,6 +1328,11 @@ def parse_args() -> argparse.Namespace:
         "--mark-transactions",
         action="store_true",
         help="Mark processed transaction rows as 已重算 after a successful run.",
+    )
+    parser.add_argument(
+        "--no-auto-dividends",
+        action="store_true",
+        help="跳过自动抓取现金分红（默认开启：把 yfinance 现金分红补录进交易流水，去重后回放）。",
     )
     return parser.parse_args()
 
@@ -1152,6 +1360,7 @@ def main() -> int:
             update_prices_flag=args.update_prices,
             dry_run=args.dry_run,
             mark_transactions=args.mark_transactions,
+            auto_dividends=not args.no_auto_dividends,
         )
     except (LarkError, RuntimeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
