@@ -1209,19 +1209,8 @@ def recalc(*, as_of: dt.date, dry_run: bool, mark_transactions: bool, auto_divid
         if peak > 0:
             max_drawdown = min(max_drawdown, value / peak - 1)
 
-    account_payload = {
-        "当前现金USD": cash,
-        "冻结现金USD": frozen_cash,
-        "可用现金USD": cash - frozen_cash,
-        "股票市值USD": pure_stock_value,
-        "类现金市值USD": cash_equiv_value,
-        "当前NAVUSD": nav,
-        "累计TWR": cumulative_twr,
-        "股票仓位率": stock_position_ratio,
-        "年化收益率": annualized_return,
-        "最大回撤": max_drawdown,
-    }
-    upsert_record(TABLE["account"], account_payload, account["record_id"], dry_run=dry_run)
+    # 账户当前状态（NAV / 现金 / 股票市值 / 仓位率 / 年化 / 回撤等）不再回写「设置」表——
+    # 已统一写入「资产快照」最新行，看板从那里读。「设置」表回归纯配置输入。
 
     current_snapshot = snapshot_by_date.get(as_of)
     benchmark_returns = latest_benchmark_returns(as_of, warnings)
@@ -1250,6 +1239,10 @@ def recalc(*, as_of: dt.date, dry_run: bool, mark_transactions: bool, auto_divid
         "恒生科技累计收益率": benchmark_returns.get("恒生科技"),
         "沪深300累计收益率": benchmark_returns.get("沪深300"),
         "标普500累计收益率": benchmark_returns.get("标普500"),
+        "股票仓位率": stock_position_ratio,
+        "年化收益率": annualized_return,
+        "最大回撤": max_drawdown,
+        "是否最新": True,
         "备注": "脚本重算生成",
     }
     upsert_record(
@@ -1258,6 +1251,10 @@ def recalc(*, as_of: dt.date, dry_run: bool, mark_transactions: bool, auto_divid
         current_snapshot["record_id"] if current_snapshot else None,
         dry_run=dry_run,
     )
+    # 只保留当前行的「是否最新」标记，历史行复位为 False（供看板锁定最新状态）。
+    for snap_date, snap_row in snapshot_by_date.items():
+        if snap_date != as_of and snap_row.get("是否最新") and snap_row.get("record_id"):
+            upsert_record(TABLE["snapshots"], {"是否最新": False}, snap_row["record_id"], dry_run=dry_run)
 
     if mark_transactions and processed_tx_ids:
         batch_mark_transactions(processed_tx_ids, dry_run=dry_run)
